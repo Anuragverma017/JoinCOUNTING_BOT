@@ -441,24 +441,27 @@ def sp_fetch_joins_for_link(
     return res.data or []
 
 
+def _safe_ascii(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^\x20-\x7E]+", " ", s)  # remove emojis/unicode
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:200]
+
 async def create_payment_link(uid: int, amount_paise: int, plan_id: str, plan_label: str) -> Optional[str]:
-    """
-    Razorpay payment link create (HTTP via aiohttp) + DB log
-    AutoForward bot wale flow ke jaisa.
-    """
+    safe_label = _safe_ascii(plan_label) or plan_id.upper()
+
     payload = {
         "amount": int(amount_paise),
         "currency": "INR",
-        "description": f"GetAIPilot — {plan_label} plan for user {uid}",
+        "description": f"GetAIPilot {safe_label} plan for user {uid}",
         "notify": {"email": False, "sms": False},
         "reminder_enable": True,
-        # 30 min ke baad expire
         "expire_by": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
         "notes": {
             "telegram_user_id": str(uid),
             "plan": plan_id,
+            "plan_label": safe_label,
         },
-        "callback_method": "get",
     }
 
     try:
@@ -466,40 +469,37 @@ async def create_payment_link(uid: int, amount_paise: int, plan_id: str, plan_la
             async with sess.post(
                 f"{RP_BASE}/payment_links",
                 headers=_rp_auth_headers(),
-                data=json.dumps(payload),
+                json=payload,   # ✅ IMPORTANT FIX
             ) as resp:
+                txt = await resp.text()
                 if resp.status >= 300:
-                    try:
-                        txt = await resp.text()
-                    except Exception:
-                        txt = "unknown error body"
                     print("Razorpay create failed:", resp.status, txt)
                     return None
 
-                data = await resp.json()
+                data = json.loads(txt)
 
         p_id = data.get("id")
         p_url = data.get("short_url") or data.get("url")
 
         if not p_id or not p_url:
-            print("create_payment_link: missing id/url in Razorpay response:", data)
+            print("Razorpay response missing id/url:", data)
             return None
 
-        # Supabase me log + subscription meta update
         sp_log_payment_link(
             uid=uid,
             plan_id=plan_id,
-            plan_label=plan_label,
+            plan_label=safe_label,
             price_paise=amount_paise,
             duration_days=PLAN_DURATION_DAYS,
             plink_id=p_id,
             plink_url=p_url,
             raw=data,
         )
+
         sp_upsert_subscription_plan_meta(
             uid=uid,
             plan_id=plan_id,
-            plan_label=plan_label,
+            plan_label=safe_label,
             price_paise=amount_paise,
             duration_days=PLAN_DURATION_DAYS,
             plink_id=p_id,
@@ -507,6 +507,7 @@ async def create_payment_link(uid: int, amount_paise: int, plan_id: str, plan_la
         )
 
         return p_url
+
     except Exception as ex:
         print("create_payment_link error:", ex)
         return None
@@ -720,16 +721,16 @@ async def cmd_start(event):
 async def help_cmd(e):
     txt = (
         "ℹ️ **How to use this bot (simple flow)**\n\n"
-        "1️⃣ Use `/login` and follow OTP / 2FA steps.\n"
+        "1️⃣ Use /login and follow OTP / 2FA steps.\n"
         "2️⃣ In your Telegram app (same account), *pin* the private channel/group\n"
         "   where you want to generate an invite link.\n"
-        "3️⃣ Come back here, type `/create_link` and select the chat using buttons.\n"
+        "3️⃣ Come back here, type /create_link and select the chat using buttons.\n"
         "4️⃣ The invite link you get from the bot is the one you should share.\n"
         "   Everyone who joins using that invite link will be counted by the bot\n"
         "   (per link, not per channel only).\n"
-        "5️⃣ Use `/stats`, `/hour_status`, `/today_status`, etc. — first you select which invite link,\n"
+        "5️⃣ Use /stats, /hour_status, /today_status, etc. — first you select which invite link,\n"
         "   then the bot will show join counts for that specific link.\n\n"
-        "❗ When you use `/remove_link` and delete a link, **all join data for that link**\n"
+        "❗ When you use /remove_link and delete a link, **all join data for that link**\n"
         "   will also be permanently deleted from the database.\n"
     )
     await e.respond(txt, parse_mode="md")
@@ -1814,7 +1815,7 @@ def sp_apply_successful_payment(uid: int, payment_row: dict) -> datetime:
 
     # Mark payment row as paid
     try:
-        supabase.table("user_payment_links").update({"status": "paid"}).eq("id", payment_row["id"]).execute()
+        supabase.table("user_payment_links").update({"status": "paid"}).eq("paymentlink_id", payment_row["paymentlink_id"]).execute()
     except Exception as ex:
         print("sp_apply_successful_payment update payment error:", ex)
 
@@ -1903,8 +1904,9 @@ async def _show_payment_created(event, plan_id: str, plan_label: str, amount_pai
         # Yaha aane ka matlab: Razorpay ne error diya (jaise Too many requests)
         return await event.edit(
             "❌ Unable to create payment link right now.\n"
-            "Possible reason: Razorpay rate-limit (Too many requests).\n"
-            "⏳ Thodi der baad fir se try karo.",
+            "❌ Unable to create payment link.\nPlease try again in a minute."
+
+            "⏳ sorry for this problem please try again.",
             parse_mode="md",
             buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
         )
@@ -1926,17 +1928,17 @@ async def _show_payment_created(event, plan_id: str, plan_label: str, amount_pai
 
 @bot.on(events.CallbackQuery(pattern=b"buy_basic"))
 async def cb_buy_basic(event):
-    await _show_payment_created(event, "basic", "💠 BASIC", BASIC_PRICE_PAISE)
+    await _show_payment_created(event, "basic", " BASIC", BASIC_PRICE_PAISE)
 
 
 @bot.on(events.CallbackQuery(pattern=b"buy_pro"))
 async def cb_buy_pro(event):
-    await _show_payment_created(event, "pro", "⚡️ PRO", PRO_PRICE_PAISE)
+    await _show_payment_created(event, "pro", " PRO", PRO_PRICE_PAISE)
 
 
 @bot.on(events.CallbackQuery(pattern=b"buy_premium"))
 async def cb_buy_premium(event):
-    await _show_payment_created(event, "premium", "💎 PREMIUM", PREMIUM_PRICE_PAISE)
+    await _show_payment_created(event, "premium", " PREMIUM", PREMIUM_PRICE_PAISE)
 
 
 async def _handle_verify(event, plan_id: str):
@@ -2088,12 +2090,6 @@ async def cb_plan_premium(event):
     if not link:
         return await event.edit("❌ Unable to create payment link. Please try again later.", buttons=None)
     await event.edit(f"🧾 **Premium Plan**\n\nPay using link below:\n{link}", buttons=None)
-
-@bot.on(events.NewMessage(pattern=r"^/upgrade_status$"))
-async def upgrade_status_cmd(e):
-    uid = e.sender_id
-    await e.respond(format_plan_status(uid), parse_mode="md")
-
 
 # ---------------- BOT PROFILE (DESCRIPTION + COMMANDS) ----------------
 
