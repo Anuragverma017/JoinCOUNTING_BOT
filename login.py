@@ -103,6 +103,8 @@ bot = TelegramClient("join_counter_bot", API_ID, API_HASH).start(bot_token=BOT_T
 # ---- in-memory state ----
 login_state: Dict[int, Dict[str, Any]] = {}
 select_state: Dict[int, Dict[str, Any]] = {}   # selection flows (create/remove links/confirm)
+# create link preference (approve vs normal)
+create_link_pref: Dict[int, str] = {}  # uid -> "approval" | "normal"
 USER_CLIENT_CACHE: Dict[int, TelegramClient] = {}
 stats_state: Dict[int, Dict[str, Any]] = {}    # stats link selection context
 
@@ -325,13 +327,20 @@ def sp_delete_session(uid: int):
     supabase.table("user_sessions").delete().eq("user_id", uid).execute()
 
 
-def sp_save_invite_link(uid: int, chat_id: int, chat_title: str, link: str):
+def sp_save_invite_link(
+    uid: int,
+    chat_id: int,
+    chat_title: str,
+    link: str,
+    link_type: str,   # 👈 NEW
+):
     supabase.table("invite_links").upsert(
         {
             "user_id": uid,
             "chat_id": chat_id,
             "chat_title": chat_title,
             "invite_link": link,
+            "link_type": link_type,   # ✅ SAVE TYPE
             "is_active": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -561,6 +570,12 @@ async def render_stats_page(event, uid: int, ctx: Dict[str, Any]):
     lines.append(f"`{title}`")
     lines.append("")
     lines.append(f"🔗 `{link}`")
+    lt = (ctx.get("link_type") or "normal").lower()
+    if lt == "approval":
+        lines.append("🛂 _required approval_")
+    else:
+        lines.append("🔓 _normal link_")
+
 
     # Link created time -> show in IST
     if created_at:
@@ -1071,13 +1086,22 @@ async def create_link_cmd(e):
     # premium check
     if not await require_active_plan(e):
         return
+
+    # default (reset preference)
+    create_link_pref.pop(e.sender_id, None)
+
     await e.respond(
-        "🔗 **Create Invite Links (Private Groups/Channels)**\n\n"
-        "1️⃣ In your Telegram app, *pin* the private channels/groups where you want invite links.\n"
-        "2️⃣ Come back here and tap the button below.\n\n"
-        "_Only groups/channels are shown (no 1-1 user chats). Max top 14 pinned chats._",
+        "🔗 **Create Invite Link**\n\n"
+        "Click on **Admin Approval Link** to create a link which requires admin to approve join requests.\n"
+        "Or click on **Normal Link** to create a normal link without approval.\n\n"
+        "👇 Choose one option:",
         parse_mode="md",
-        buttons=[[Button.inline("📌 I have pinned the chats", data=b"pin_create_links")]],
+        buttons=[
+            [
+                Button.inline("✅ Admin Approval Link", data=b"cl_type:approval"),
+                Button.inline("🔗 Normal Link", data=b"cl_type:normal"),
+            ]
+        ],
     )
 
 
@@ -1107,6 +1131,26 @@ async def cb_pin_create_links(event):
         "🔗 Select chats for which you want new invite links (multi-select).\n"
         "Tap numbers to toggle, then **Done**.\n\n" + numbered_list_from_pairs(pairs),
         buttons=multi_kb(len(pairs), set()),
+    )
+
+@bot.on(events.CallbackQuery(pattern=b"^cl_type:"))
+async def cb_choose_create_link_type(event):
+    uid = event.sender_id
+    choice = event.data.decode().split(":", 1)[1]  # approval | normal
+
+    if choice not in ("approval", "normal"):
+        return await event.answer("Invalid choice.", alert=True)
+
+    create_link_pref[uid] = choice
+
+    # Continue old flow (pinned instruction)
+    await event.edit(
+        "🔗 **Create Invite Links (Private Groups/Channels)**\n\n"
+        "1️⃣ In your Telegram app, *pin* the private channels/groups where you want invite links.\n"
+        "2️⃣ Come back here and tap the button below.\n\n"
+        "_Only groups/channels are shown (no 1-1 user chats). Max top 14 pinned chats._",
+        parse_mode="md",
+        buttons=[[Button.inline("📌 I have pinned the chats", data=b"pin_create_links")]],
     )
 
 
@@ -1177,19 +1221,25 @@ async def cb_msel_done(event):
             chat_id, title = st["pairs"][idx]
             try:
                 # Export private invite link
+
+                link_type = create_link_pref.get(uid, "normal")
+                request_needed = True if link_type == "approval" else False
                 res = await uc(
                     functions.messages.ExportChatInviteRequest(
                         peer=chat_id,
                         legacy_revoke_permanent=False,
+                        request_needed=request_needed,   # ✅ admin approval toggle
                     )
                 )
                 link = res.link if hasattr(res, "link") else str(res)
-                sp_save_invite_link(uid, int(chat_id), title, link)
+                sp_save_invite_link(uid, int(chat_id), title, link, link_type)
+                tag = " ✅ (Approval Required)" if request_needed else ""
                 created_lines.append(f"• `{title}` → {link}")
             except Exception as ex:
                 created_lines.append(f"• `{title}` → ❌ `{ex}`")
 
         select_state.pop(uid, None)
+        create_link_pref.pop(uid, None)   # ✅ YAHAN add karna hai (important)
         txt = "✅ **Invite links created / saved:**\n\n" + "\n".join(created_lines)
         return await event.edit(txt, parse_mode="md", buttons=None)
 
@@ -1305,8 +1355,13 @@ async def links_cmd(e):
         title = r.get("chat_title") or f"id:{r.get('chat_id')}"
         link = r.get("invite_link") or "-"
         created = str(r.get("created_at") or "")[:19]
-        lines.append(f"- `{title}`\n  {link}\n  _created: {created}_\n")
-
+        link_type = r.get("link_type", "normal")
+        badge = "🛂 _required approval_" if link_type == "approval" else ""
+        lines.append(
+            f"- `{title}` {badge}\n"
+            f"  {link}\n"
+            f"  _created: {created}_\n"
+        )
     await e.respond("\n".join(lines), parse_mode="md")
 
 
@@ -1524,10 +1579,12 @@ async def cb_stats_link(event):
         title = chosen.get("chat_title") or f"id:{chosen.get('chat_id')}"
         link = chosen.get("invite_link") or "-"
         created_at = chosen.get("created_at")
+        link_type = chosen.get("link_type", "normal")  # ✅ NEW
     else:
         title = "(link not found / removed)"
         link = "-"
         created_at = None
+        link_type = "normal"
 
     # Normal page size
     page_size = 15
@@ -1545,6 +1602,8 @@ async def cb_stats_link(event):
         "title": title,
         "link": link,
         "created_at": created_at,
+        "link_type": link_type,  # ✅ NEW
+
     }
 
     # Render first page
