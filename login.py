@@ -1,29 +1,16 @@
-# --------------------------------------------------- 
-# Telegram Private Join-Link Counter Bot
-# Uses: Telethon + Supabase
-# Focus:
-#   - Login user account
-#   - Create & track invite links (ONLY groups/channels, no user chats)
-#   - Show per-link join stats (with selection + pagination)
-#   - /remove_link also deletes join data for that link (with confirmation)
-#   - Subscription system shared with AutoForward bot (Razorpay + Supabase)
-# ---------------------------------------------------
-
 import os
 import re
+import calendar
+
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Set, Any, Optional
-
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import aiohttp, json, base64  # HTTP Razorpay client
-
 from telethon import TelegramClient, events, errors, Button
 from telethon import types as tl_types  # for User/Chat/Channel/UpdateBotChatInviteRequester, InputUserEmpty
 from telethon.tl import functions, types
 from telethon.utils import get_peer_id
-
 # ---------------- ENV & GLOBALS ----------------
 
 load_dotenv()
@@ -39,15 +26,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY
 SESSION_DIR = os.getenv("SESSION_DIR", "sessions")
 TOP_N = 14  # how many pinned chats to show in selection
 
-# Razorpay env (same as AutoForward bot)
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 
-# Plan config
-PLAN_DURATION_DAYS = int(os.getenv("PLAN_DURATION_DAYS", "30"))
-BASIC_PRICE_PAISE = int(os.getenv("BASIC_PRICE_PAISE", "69900"))
-PRO_PRICE_PAISE = int(os.getenv("PRO_PRICE_PAISE", "149900"))
-PREMIUM_PRICE_PAISE = int(os.getenv("PREMIUM_PRICE_PAISE", "249900"))
 
 assert API_ID and API_HASH and BOT_TOKEN, "Set API_ID, API_HASH, BOT_TOKEN in .env"
 assert SUPABASE_URL and SUPABASE_KEY, "Set SUPABASE_URL and SUPABASE_KEY / SUPABASE_SERVICE_ROLE_KEY in .env"
@@ -56,47 +35,8 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- Razorpay (HTTP flow same as AutoForward bot) ---
-RP_BASE = "https://api.razorpay.com/v1"
-# yahan RAZORPAY_KEY_ID / SECRET upar already defined hain
-assert RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET, "Set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env"
 
-def _rp_auth_headers():
-    token = base64.b64encode(f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()).decode()
-    return {
-        "Authorization": f"Basic {token}",
-        "Content-Type": "application/json",
-    }
-
-def sp_log_payment_link(uid: int, plan_id: str, plan_label: str, price_paise: int,
-                        duration_days: int, plink_id: str, plink_url: str, raw: dict):
-    supabase.table("user_payment_links").upsert({
-        "user_id": uid,
-        "plan_id": plan_id,
-        "plan_label": plan_label,
-        "price_paise": int(price_paise),
-        "duration_days": int(duration_days),
-        "paymentlink_id": plink_id,
-        "paymentlink_url": plink_url,
-        "status": "created",
-        "raw": raw,
-    }, on_conflict="paymentlink_id").execute()
-
-def sp_upsert_subscription_plan_meta(uid: int, plan_id: str, plan_label: str,
-                                     price_paise: int, duration_days: int,
-                                     plink_id: str, plink_url: str):
-    now = datetime.now(timezone.utc).isoformat()
-    supabase.table("user_subscriptions").upsert({
-        "user_id": uid,
-        "plan_id": plan_id,
-        "plan_label": plan_label,
-        "plan_price_paise": int(price_paise),
-        "plan_duration_days": int(duration_days),
-        "last_paymentlink_id": plink_id,
-        "last_paymentlink_url": plink_url,
-        "last_payment_status": "created",
-        "updated_at": now,
-    }, on_conflict="user_id").execute()
+# ---------------- SUPABASE + SUBSCRIPTION HELPERS ----------------
 
 bot = TelegramClient("join_counter_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
@@ -107,6 +47,7 @@ select_state: Dict[int, Dict[str, Any]] = {}   # selection flows (create/remove 
 create_link_pref: Dict[int, str] = {}  # uid -> "approval" | "normal"
 USER_CLIENT_CACHE: Dict[int, TelegramClient] = {}
 stats_state: Dict[int, Dict[str, Any]] = {}    # stats link selection context
+date_select_state: Dict[int, Dict[str, Any]] = {}  # uid -> {step, link_id, month, year, start_date, end_date, ...}
 
 # per-message stats pagination state
 stats_pages: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -231,73 +172,12 @@ def multi_kb(n: int, selected: Set[int]) -> List[List[Button]]:
 
 # ---------------- SUPABASE + SUBSCRIPTION HELPERS ----------------
 
-def sp_get_subscription(uid: int) -> Optional[dict]:
-    """
-    Fetch user's subscription row from user_subscriptions table.
-    """
-    try:
-        res = (
-            supabase.table("user_subscriptions")
-            .select("*")
-            .eq("user_id", uid)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception as ex:
-        print("sp_get_subscription error:", ex)
-        return None
 
 
-def is_plan_active(sub: dict) -> bool:
-    """
-    Check if subscription is active based on expires_at timestamp.
-    """
-    try:
-        exp = sub.get("expires_at")
-        if not exp:
-            return False
-        exp_dt = datetime.fromisoformat(str(exp).replace("Z", "")).astimezone(timezone.utc)
-        return datetime.now(timezone.utc) < exp_dt
-    except Exception:
-        return False
 
 
-def format_plan_status(uid: int) -> str:
-    """
-    Returns human readable string for /upgrade_status based on subscription.
-    """
-    sub = sp_get_subscription(uid)
-    if not sub:
-        return "🔴 **No active plan found.**\nUse /upgrade to purchase any plan."
-
-    if not is_plan_active(sub):
-        return "🟠 **Your plan has expired.**\nUse /upgrade to renew."
-
-    expires = str(sub.get("expires_at")).replace("Z", "")[:19]
-    label = sub.get("plan_label") or "Unknown Plan"
-
-    return (
-        f"🟢 **Active Plan: {label}**\n"
-        f"📅 **Expires at:** `{expires}`\n\n"
-        "Thank you for being a premium user! 🎉"
-    )
 
 
-async def require_active_plan(e) -> bool:
-    """
-    Used to protect premium commands (same behaviour as AutoForward bot).
-    """
-    uid = e.sender_id
-    sub = sp_get_subscription(uid)
-    if not sub or not is_plan_active(sub):
-        await e.respond(
-            "🔴 **You do not have an active plan.**\n\n"
-            "Use `/upgrade` to purchase a plan.",
-            parse_mode="md",
-        )
-        return False
-    return True
 
 
 def sp_get_session(uid: int) -> Optional[dict]:
@@ -383,9 +263,34 @@ def sp_soft_delete_links(uid: int, link_ids: List[int]):
 
 
 def sp_replace_joins_for_link(uid: int, invite_link_id: int, rows: List[dict]):
-    supabase.table("joins").delete().eq("user_id", uid).eq("invite_link_id", invite_link_id).execute()
-    if rows:
-        supabase.table("joins").insert(rows).execute()
+    """
+    Upsert join rows WITHOUT usernames.
+    Important:
+      - Unique user per link (won't double count)
+      - If user re-joins, we CLEAR left_at so "current joined" becomes correct.
+    """
+    if not rows:
+        return
+
+    clean_rows = []
+    for r in rows:
+        clean_rows.append({
+            "user_id": r["user_id"],
+            "chat_id": r["chat_id"],
+            "invite_link_id": r["invite_link_id"],
+            "joined_user_id": r["joined_user_id"],
+            "joined_at": r.get("joined_at"),
+
+            # ✅ Rejoin fix: mark as currently active by clearing left fields
+            "left_at": None,
+            "left_reason": None,
+            "left_seen_at": None,
+        })
+
+    supabase.table("joins").upsert(
+        clean_rows,
+        on_conflict="user_id,chat_id,invite_link_id,joined_user_id"
+    ).execute()
 
 
 def _count_from_response(res) -> int:
@@ -412,6 +317,27 @@ def sp_count_joins_for_link(
         .select("id", count="exact")
         .eq("user_id", uid)
         .eq("invite_link_id", invite_link_id)
+    )
+    if since:
+        q = q.gte("joined_at", since.isoformat())
+    if until:
+        q = q.lte("joined_at", until.isoformat())
+    res = q.execute()
+    return _count_from_response(res)
+
+
+def sp_count_left_for_link(
+    uid: int,
+    invite_link_id: int,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> int:
+    q = (
+        supabase.table("joins")
+        .select("id", count="exact")
+        .eq("user_id", uid)
+        .eq("invite_link_id", invite_link_id)
+        .not_.is_("left_at", "null")
     )
     if since:
         q = q.gte("joined_at", since.isoformat())
@@ -456,186 +382,71 @@ def _safe_ascii(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:200]
 
-async def create_payment_link(uid: int, amount_paise: int, plan_id: str, plan_label: str) -> Optional[str]:
-    safe_label = _safe_ascii(plan_label) or plan_id.upper()
 
-    payload = {
-        "amount": int(amount_paise),
-        "currency": "INR",
-        "description": f"GetAIPilot {safe_label} plan for user {uid}",
-        "notify": {"email": False, "sms": False},
-        "reminder_enable": True,
-        "expire_by": int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp()),
-        "notes": {
-            "telegram_user_id": str(uid),
-            "plan": plan_id,
-            "plan_label": safe_label,
-        },
-    }
-
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{RP_BASE}/payment_links",
-                headers=_rp_auth_headers(),
-                json=payload,   # ✅ IMPORTANT FIX
-            ) as resp:
-                txt = await resp.text()
-                if resp.status >= 300:
-                    print("Razorpay create failed:", resp.status, txt)
-                    return None
-
-                data = json.loads(txt)
-
-        p_id = data.get("id")
-        p_url = data.get("short_url") or data.get("url")
-
-        if not p_id or not p_url:
-            print("Razorpay response missing id/url:", data)
-            return None
-
-        sp_log_payment_link(
-            uid=uid,
-            plan_id=plan_id,
-            plan_label=safe_label,
-            price_paise=amount_paise,
-            duration_days=PLAN_DURATION_DAYS,
-            plink_id=p_id,
-            plink_url=p_url,
-            raw=data,
-        )
-
-        sp_upsert_subscription_plan_meta(
-            uid=uid,
-            plan_id=plan_id,
-            plan_label=safe_label,
-            price_paise=amount_paise,
-            duration_days=PLAN_DURATION_DAYS,
-            plink_id=p_id,
-            plink_url=p_url,
-        )
-
-        return p_url
-
-    except Exception as ex:
-        print("create_payment_link error:", ex)
-        return None
-
+# ---------------- STATS PAGE RENDER HELPER ----------------
 
 # ---------------- STATS PAGE RENDER HELPER ----------------
 
 async def render_stats_page(event, uid: int, ctx: Dict[str, Any]):
     """
-    Render one page of stats (joins list) with pagination.
-    Newest first (joined_at DESC).
+    FAST summary stats only:
+    - Total joins (unique users ever joined via link)
+    - Total left
+    - Current joined = joins - left
+    - No user IDs, no join list
     """
     link_id = ctx["link_id"]
     label = ctx["label"]
     since = ctx["since"]
     until = ctx["until"]
-    offset = ctx["offset"]
-    page_size = ctx["page_size"]
     total = ctx["total"]
     title = ctx["title"]
     link = ctx["link"]
     created_at = ctx.get("created_at")
 
-    # India timezone (IST)
     IST = timezone(timedelta(hours=5, minutes=30))
 
-    # Fetch page of join rows (newest first)
-    rows = sp_fetch_joins_for_link(
-        uid,
-        link_id,
-        since=since,
-        until=until,
-        offset=offset,
-        limit=page_size,
+    # left count (same filter range)
+    left_q = (
+        supabase.table("joins")
+        .select("id", count="exact")
+        .eq("user_id", uid)
+        .eq("invite_link_id", link_id)
+        .not_.is_("left_at", "null")
     )
+    if since:
+        left_q = left_q.gte("joined_at", since.isoformat())
+    if until:
+        left_q = left_q.lte("joined_at", until.isoformat())
+    left_count = _count_from_response(left_q.execute())
 
-    # We need user client to resolve usernames
-    try:
-        uc = await get_user_client(uid)
-    except Exception as ex:
-        return await event.edit(
-            f"❌ Error loading user session for stats:\n`{ex}`",
-            parse_mode="md",
-            buttons=None,
-        )
+    active_count = total - left_count
 
-    # Header
     lines: List[str] = []
-
-    lines.append(f"📊 **{label} stats for:**")
+    lines.append(f"📊 **{label} stats**")
     lines.append(f"`{title}`")
     lines.append("")
     lines.append(f"🔗 `{link}`")
+
     lt = (ctx.get("link_type") or "normal").lower()
-    if lt == "approval":
-        lines.append("🛂 _required approval_")
-    else:
-        lines.append("🔓 _normal link_")
+    lines.append("🛂 _required approval_" if lt == "approval" else "🔓 _normal link_")
 
-
-    # Link created time -> show in IST
     if created_at:
         try:
             clean = str(created_at).replace("Z", "")
             dt = datetime.fromisoformat(clean)
             dt_ist = dt.astimezone(IST)
-            created_str = dt_ist.strftime("%Y-%m-%d %H:%M IST")
+            created_str = dt_ist.strftime("%d %b %Y, %H:%M IST")
         except Exception:
             created_str = str(created_at)
-        lines.append(f"📅 Link created at: `{created_str}`")
+        lines.append(f"📅 Link created: `{created_str}`")
 
-    lines.append(f"👥 Total joins ({label}): `{total}`")
     lines.append("")
+    lines.append(f"👥 Total joins: `{total}`")
+    lines.append(f"🚪 Total left: `{left_count}`")
+    lines.append(f"🟢 Current joined: `{active_count}`")
 
-    if not rows:
-        lines.append("ℹ️ No joins found in this range yet.")
-    else:
-        start_idx = offset + 1
-        end_idx = offset + len(rows)
-        lines.append(
-            f"📌 Showing `{start_idx}-{end_idx}` of `{total}` joins (newest first):\n"
-        )
-
-        for i, r in enumerate(rows):
-            joined_user_id = r.get("joined_user_id")
-
-            # Default display name
-            line_index = offset + i + 1
-            display_name = f"User {line_index}"
-
-            # Try to resolve real Telegram name (for real users)
-            try:
-                if joined_user_id:
-                    ent = await uc.get_entity(int(joined_user_id))
-                    display_name = title_of(ent)
-            except Exception:
-                # For IDs jinke liye entity nahi milti (dummy / deleted), fallback hi rahega
-                pass
-
-            lines.append(f"{line_index}. **{display_name}**")
-
-    # Build pagination buttons
-    buttons: List[List[Button]] = []
-    nav_row: List[Button] = []
-
-    # Prev button
-    if offset > 0:
-        nav_row.append(Button.inline("⬅️ Prev", data=b"stats_page:prev"))
-
-    # Next button
-    if offset + page_size < total:
-        nav_row.append(Button.inline("➡️ Next", data=b"stats_page:next"))
-
-    if nav_row:
-        buttons.append(nav_row)
-
-    # Close button
-    buttons.append([Button.inline("✖ Close", data=b"stats_page:close")])
-
+    buttons = [[Button.inline("✖ Close", data=b"stats_page:close")]]
     await event.edit("\n".join(lines), parse_mode="md", buttons=buttons)
 
 
@@ -690,13 +501,14 @@ def commands_text() -> str:
         "📖 Commands:",
         "",
         "▶️ /start — Show this help & all commands",
-        "🎯 /start_demo — Try limited demo mode",
         "ℹ️ /help — Short usage guide",
         "🧷 /create_link — Create invite links for pinned private groups/channels",
         "📋 /links — List your active tracked invite links",
         "🗑️ /remove_link — Remove invite links (and their join data)",
         "",
+        "📊 /select_date — Select date from the calendar",
         "📊 /stats — Select link & view all-time joins",
+        "🗓️ /yesterday — Joins yesterday (IST)",
         "⏱️ /hour_status — Joins in last 1 hour",
         "📅 /today_status — Joins today",
         "📆 /week_status — Joins in last 7 days",
@@ -708,10 +520,9 @@ def commands_text() -> str:
         "✅ /status — Check login status",
         "🚪 /logout — Delete session & stop tracking",
         "",
-        "💳 /upgrade — View and buy premium plans",
-        "📡 /upgrade_status — Check your plan status",
+    
         "",
-        "_Flow: `/login` → `/create_link` → share invite link → `/stats` for join tracking._",
+        "_Flow: /login → /create_link → share invite link → /stats for join tracking._",
     ]
     return "\n".join(lines)
 
@@ -751,19 +562,6 @@ async def help_cmd(e):
     await e.respond(txt, parse_mode="md")
 
 
-@bot.on(events.NewMessage(pattern=r"^/start_demo$"))
-async def start_demo_cmd(e):
-    txt = (
-        "🎉 **DEMO MODE ACTIVATED**\n\n"
-        "This is a limited demo version of Join Counting Bot.\n"
-        "You can:\n"
-        "• Login\n"
-        "• Create invite links\n"
-        "• See stats\n\n"
-        "⚠️ **Full features require a plan.**\n"
-        "Use `/upgrade` to unlock unlimited counting + AutoApproval bot + Full suite."
-    )
-    await e.respond(txt, parse_mode="md")
 
 
 @bot.on(events.NewMessage(pattern=r"^/status$"))
@@ -789,7 +587,7 @@ async def login_cmd(e):
     uid = e.sender_id
     if await is_logged_in(uid):
         return await e.respond(
-            "✅ Already logged in.\nNow use `/create_link` to generate invite links.",
+            "✅ Already logged in.\nNow use /create_link to generate invite links.",
             parse_mode="md",
         )
     login_state[uid] = {"step": "phone", "phone": None}
@@ -838,7 +636,7 @@ async def login_flow(e):
                 sp_upsert_session(uid, phone, os.path.basename(local))
                 await e.respond(
                     f"✅ Already logged in as **{me.first_name}**.\n"
-                    "Use `/create_link` to generate invite links.",
+                    "Use /create_link to generate invite links.",
                     parse_mode="md",
                 )
                 login_state.pop(uid, None)
@@ -898,7 +696,7 @@ async def login_flow(e):
                 sp_upsert_session(uid, phone, os.path.basename(local))
                 await e.respond(
                     f"✅ Logged in as **{me.first_name}**.\n"
-                    "Now use `/create_link` to generate invite links.",
+                    "Now use /create_link to generate invite links.",
                     parse_mode="md",
                 )
                 login_state.pop(uid, None)
@@ -951,7 +749,7 @@ async def login_flow(e):
             sp_upsert_session(uid, phone, os.path.basename(local))
             await e.respond(
                 f"✅ 2FA verified. Logged in as **{me.first_name}**.\n"
-                "Now use `/create_link` to generate invite links.",
+                "Now use /create_link to generate invite links.",
                 parse_mode="md",
             )
         except errors.PasswordHashInvalidError:
@@ -971,6 +769,73 @@ async def login_flow(e):
             except Exception:
                 pass
 
+def build_calendar_kb(year: int, month: int, selected_start: Optional[str], selected_end: Optional[str]) -> List[List[Button]]:
+    """
+    Inline calendar for a month.
+    selected_start/end are 'YYYY-MM-DD' strings (for highlighting).
+    """
+    cal = calendar.monthcalendar(year, month)
+
+    header = f"{calendar.month_name[month]} {year}"
+    rows: List[List[Button]] = []
+
+    # Month header row (non-clickable title) + nav
+    rows.append([
+        Button.inline("⬅️", data=f"cal_nav:prev:{year}:{month}".encode()),
+        Button.inline(header, data=b"cal_noop"),
+        Button.inline("➡️", data=f"cal_nav:next:{year}:{month}".encode()),
+    ])
+
+    # Weekday row
+    rows.append([
+        Button.inline("Mo", data=b"cal_noop"),
+        Button.inline("Tu", data=b"cal_noop"),
+        Button.inline("We", data=b"cal_noop"),
+        Button.inline("Th", data=b"cal_noop"),
+        Button.inline("Fr", data=b"cal_noop"),
+        Button.inline("Sa", data=b"cal_noop"),
+        Button.inline("Su", data=b"cal_noop"),
+    ])
+
+    # Days
+    for week in cal:
+        week_row: List[Button] = []
+        for day in week:
+            if day == 0:
+                week_row.append(Button.inline(" ", data=b"cal_noop"))
+                continue
+
+            dstr = f"{year:04d}-{month:02d}-{day:02d}"
+
+            # highlight selected range
+            label = str(day)
+            if selected_start == dstr:
+                label = f"🟢{day}"
+            if selected_end == dstr:
+                label = f"🔴{day}"
+
+            # simple range highlight (optional)
+            if selected_start and selected_end:
+                try:
+                    s = datetime.fromisoformat(selected_start)
+                    e = datetime.fromisoformat(selected_end)
+                    cur = datetime.fromisoformat(dstr)
+                    if s <= cur <= e and dstr not in (selected_start, selected_end):
+                        label = f"•{day}"
+                except Exception:
+                    pass
+
+            week_row.append(Button.inline(label, data=f"cal_day:{dstr}".encode()))
+        rows.append(week_row)
+
+    # action row
+    rows.append([
+        Button.inline("✖ Cancel", data=b"cal_cancel"),
+        Button.inline("🔄 Reset", data=b"cal_reset"),
+    ])
+    return rows
+
+
 # ---------- START MENU INLINE BUTTON HANDLERS ----------
 
 @bot.on(events.CallbackQuery(pattern=b"menu_login"))
@@ -981,7 +846,7 @@ async def cb_menu_login(event):
 @bot.on(events.CallbackQuery(pattern=b"menu_create_link"))
 async def cb_menu_create_link(event):
     await event.answer()
-    await event.respond("🧷 Naya invite link banane ke liye:\n\n`/create_link`\n\nYeh command sirf un groups/channels ke liye kaam karegi jahan tum admin ho.", parse_mode="md")
+    await event.respond("🧷 Naya invite link banane ke liye:\n\n/create_link\n\nYeh command sirf un groups/channels ke liye kaam karegi jahan tum admin ho.", parse_mode="md")
 
 @bot.on(events.CallbackQuery(pattern=b"menu_links"))
 async def cb_menu_links(event):
@@ -993,15 +858,6 @@ async def cb_menu_stats(event):
     await event.answer()
     await event.respond("📊 Joins ka stats dekhne ke liye:\n\n`/stats`\n\nYa jo bhi tumne stats wali command rakhi hai (agar naam alag hai to yahan update kar lena).", parse_mode="md")
 
-@bot.on(events.CallbackQuery(pattern=b"menu_upgrade"))
-async def cb_menu_upgrade(event):
-    await event.answer()
-    await event.respond("💳 Plan details aur payment link ke liye command use karo:\n\n`/upgrade`", parse_mode="md")
-
-@bot.on(events.CallbackQuery(pattern=b"menu_upgrade_status"))
-async def cb_menu_upgrade_status(event):
-    await event.answer()
-    await event.respond("📡 Apna current plan / expiry dekhne ke liye:\n\n`/upgrade_status`", parse_mode="md")
 
 
 @bot.on(events.CallbackQuery(pattern=b"resend_otp"))
@@ -1084,8 +940,7 @@ async def create_link_cmd(e):
     if not await is_logged_in(e.sender_id):
         return await e.respond("🔒 Please `/login` first.", parse_mode="md")
     # premium check
-    if not await require_active_plan(e):
-        return
+    
 
     # default (reset preference)
     create_link_pref.pop(e.sender_id, None)
@@ -1103,6 +958,36 @@ async def create_link_cmd(e):
             ]
         ],
     )
+
+@bot.on(events.NewMessage(pattern=r"^/select_date$"))
+async def select_date_cmd(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+
+    rows = sp_list_invite_links(uid)
+    if not rows:
+        return await e.respond("ℹ️ No active invite links. Use `/create_link` first.", parse_mode="md")
+
+    # store state
+    now = datetime.now(timezone.utc)
+    date_select_state[uid] = {
+        "step": "choose_link",
+        "start_date": None,
+        "end_date": None,
+        "year": now.year,
+        "month": now.month,
+        "label": "Custom Range",
+    }
+
+    btn_rows: List[List[Button]] = []
+    for r in rows[:10]:
+        title = r.get("chat_title") or f"id:{r.get('chat_id')}"
+        short = (title[:40] + "…") if len(title) > 40 else title
+        btn_rows.append([Button.inline(short, data=f"dr_link:{r['id']}".encode())])
+    btn_rows.append([Button.inline("✖ Cancel", data=b"dr_cancel")])
+
+    await e.respond("📅 **Select link first:**", parse_mode="md", buttons=btn_rows)
 
 
 @bot.on(events.CallbackQuery(pattern=b"^pin_create_links$"))
@@ -1132,6 +1017,177 @@ async def cb_pin_create_links(event):
         "Tap numbers to toggle, then **Done**.\n\n" + numbered_list_from_pairs(pairs),
         buttons=multi_kb(len(pairs), set()),
     )
+
+@bot.on(events.CallbackQuery(pattern=b"^dr_link:"))
+async def cb_dr_link(event):
+    uid = event.sender_id
+    st = date_select_state.get(uid)
+    if not st:
+        return await event.answer("Session expired. Run /select_date again.", alert=True)
+
+    try:
+        link_id = int(event.data.decode().split(":")[1])
+    except Exception:
+        return await event.answer("Invalid link.", alert=True)
+
+    st["link_id"] = link_id
+    st["step"] = "pick_start"
+
+    year, month = st["year"], st["month"]
+    kb = build_calendar_kb(year, month, st.get("start_date"), st.get("end_date"))
+
+    await event.edit(
+        "🟢 Select **START date** (calendar):",
+        parse_mode="md",
+        buttons=kb
+    )
+
+@bot.on(events.CallbackQuery(pattern=b"^cal_nav:"))
+async def cb_cal_nav(event):
+    uid = event.sender_id
+    st = date_select_state.get(uid)
+    if not st:
+        return await event.answer("Session expired.", alert=True)
+
+    parts = event.data.decode().split(":")
+    direction = parts[1]
+    year = int(parts[2]); month = int(parts[3])
+
+    if direction == "prev":
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    else:
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
+
+    st["year"], st["month"] = year, month
+    kb = build_calendar_kb(year, month, st.get("start_date"), st.get("end_date"))
+
+    step = st.get("step", "pick_start")
+    title = "🟢 Select **START date**" if step == "pick_start" else "🔴 Select **END date**"
+    await event.edit(title, parse_mode="md", buttons=kb)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^cal_day:"))
+async def cb_cal_day(event):
+    uid = event.sender_id
+    st = date_select_state.get(uid)
+    if not st:
+        return await event.answer("Session expired.", alert=True)
+
+    dstr = event.data.decode().split(":", 1)[1]  # YYYY-MM-DD
+
+    step = st.get("step")
+    if step == "pick_start":
+        st["start_date"] = dstr
+        st["end_date"] = None
+        st["step"] = "pick_end"
+
+        kb = build_calendar_kb(st["year"], st["month"], st["start_date"], st.get("end_date"))
+        return await event.edit(
+            f"✅ Start date set: `{dstr}`\n\n🔴 Now select **END date**:",
+            parse_mode="md",
+            buttons=kb
+        )
+
+    if step == "pick_end":
+        # ensure end >= start
+        try:
+            s = datetime.fromisoformat(st["start_date"])
+            e = datetime.fromisoformat(dstr)
+            if e < s:
+                return await event.answer("End date must be >= start date.", alert=True)
+        except Exception:
+            return await event.answer("Invalid date.", alert=True)
+
+        st["end_date"] = dstr
+
+        # ✅ Now run stats
+        start_str = st["start_date"]
+        end_str = st["end_date"]
+        link_id = st["link_id"]
+
+        # Convert selected dates to UTC range based on IST day boundaries
+        IST = timezone(timedelta(hours=5, minutes=30))
+
+        start_ist = datetime.fromisoformat(start_str).replace(tzinfo=IST, hour=0, minute=0, second=0, microsecond=0)
+        end_ist = datetime.fromisoformat(end_str).replace(tzinfo=IST, hour=23, minute=59, second=59, microsecond=999999)
+
+        since_utc = start_ist.astimezone(timezone.utc)
+        until_utc = end_ist.astimezone(timezone.utc)
+
+        await event.edit(
+            "⏳ Syncing join data from Telegram for this link...\nPlease wait 2–3 seconds.",
+            buttons=None
+        )
+
+        # sync (same like /stats)
+        await sync_importers_to_db(uid)
+
+        # counts
+        total = sp_count_joins_for_link(uid, link_id, since=since_utc, until=until_utc)
+        left_total = sp_count_left_for_link(uid, link_id, since=since_utc, until=until_utc)
+        active_total = total - left_total
+
+        # link info
+        rows = sp_list_invite_links(uid)
+        chosen = next((r for r in rows if int(r["id"]) == link_id), None)
+
+        title = chosen.get("chat_title") if chosen else "Unknown"
+        link = chosen.get("invite_link") if chosen else "-"
+        link_type = (chosen.get("link_type") if chosen else "normal")
+
+        msg_lines = []
+        msg_lines.append("📊 **Custom Range stats**")
+        msg_lines.append(f"`{title}`")
+        msg_lines.append("")
+        msg_lines.append(f"🗓️ Range: `{start_str}` → `{end_str}` (IST)")
+        msg_lines.append(f"🔗 `{link}`")
+        msg_lines.append("🛂 _required approval_" if (link_type == "approval") else "🔓 _normal link_")
+        msg_lines.append("")
+        msg_lines.append(f"👥 Total joins: `{total}`")
+        msg_lines.append(f"🚪 Total left: `{left_total}`")
+        msg_lines.append(f"🟢 Current joined: `{active_total}`")
+
+        date_select_state.pop(uid, None)
+        return await event.edit("\n".join(msg_lines), parse_mode="md", buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"^cal_reset$"))
+async def cb_cal_reset(event):
+    uid = event.sender_id
+    st = date_select_state.get(uid)
+    if not st:
+        return await event.answer("Session expired.", alert=True)
+
+    st["start_date"] = None
+    st["end_date"] = None
+    st["step"] = "pick_start"
+
+    kb = build_calendar_kb(st["year"], st["month"], None, None)
+    await event.edit("🟢 Select **START date** (calendar):", parse_mode="md", buttons=kb)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^cal_cancel$"))
+async def cb_cal_cancel(event):
+    date_select_state.pop(event.sender_id, None)
+    await event.edit("✖ Date selection cancelled.", buttons=None)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^dr_cancel$"))
+async def cb_dr_cancel(event):
+    date_select_state.pop(event.sender_id, None)
+    await event.edit("✖ Cancelled.", buttons=None)
+
+
+@bot.on(events.CallbackQuery(pattern=b"^cal_noop$"))
+async def cb_cal_noop(event):
+    await event.answer()
+
 
 @bot.on(events.CallbackQuery(pattern=b"^cl_type:"))
 async def cb_choose_create_link_type(event):
@@ -1206,7 +1262,7 @@ async def cb_msel_done(event):
         if not chosen:
             select_state.pop(uid, None)
             return await event.edit(
-                "ℹ️ No chats selected. Use `/create_link` again.",
+                "ℹ️ No chats selected. Use /create_link again.",
                 buttons=None,
             )
 
@@ -1342,12 +1398,10 @@ async def links_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
         return await e.respond("🔒 Please `/login` first.", parse_mode="md")
-    if not await require_active_plan(e):
-        return
     rows = sp_list_invite_links(uid)
     if not rows:
         return await e.respond(
-            "ℹ️ No active invite links yet. Use `/create_link`.",
+            "ℹ️ No active invite links yet. Use /create_link.",
             parse_mode="md",
         )
     lines = ["📋 **Your tracked invite links:**", ""]
@@ -1370,8 +1424,6 @@ async def remove_link_cmd(e):
     uid = e.sender_id
     if not await is_logged_in(uid):
         return await e.respond("🔒 Please `/login` first.", parse_mode="md")
-    if not await require_active_plan(e):
-        return
     rows = sp_list_invite_links(uid)
     if not rows:
         return await e.respond("ℹ️ No active links to remove.", parse_mode="md")
@@ -1481,7 +1533,6 @@ async def sync_importers_to_db(uid: int):
                         "chat_id": chat_id,
                         "invite_link_id": invite_link_id,
                         "joined_user_id": user_id,
-                        "joined_username": username,  # <-- NEW COLUMN
                         "joined_at": joined_at.isoformat(),
                     }
                 )
@@ -1491,6 +1542,103 @@ async def sync_importers_to_db(uid: int):
                 continue
 
         sp_replace_joins_for_link(uid, invite_link_id, join_rows)
+
+        # ✅ LEFT DETECT BLOCK (PASTE HERE)
+        # For each joined_user_id already stored for this link -> check if still member
+        try:
+            existing = (
+                supabase.table("joins")
+                .select("id,joined_user_id,left_at")
+                .eq("user_id", uid)
+                .eq("invite_link_id", invite_link_id)
+                .execute()
+            ).data or []
+
+            for row in existing:
+                if row.get("left_at"):
+                    continue
+
+                member_uid = int(row["joined_user_id"])
+
+                try:
+                    # If user is still in chat, this will succeed
+                    await uc(functions.channels.GetParticipantRequest(
+                        channel=peer,
+                        participant=member_uid
+                    ))
+                except Exception:
+                    # Not in chat anymore -> mark as left
+                    supabase.table("joins").update({
+                        "left_at": datetime.now(timezone.utc).isoformat(),
+                        "left_reason": "left",
+                        "left_seen_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", row["id"]).execute()
+
+        except Exception as ex:
+            print("left-check error:", ex)
+
+
+@bot.on(events.ChatAction)
+async def track_user_left(e: events.ChatAction.Event):
+    """
+    Detect when a user leaves or is kicked from a tracked chat
+    and mark left_at in joins table.
+    """
+    try:
+        if not e.chat_id or not e.user_id:
+            return
+
+        # Sirf leave / kick cases
+        if not (e.user_left or e.user_kicked):
+            return
+
+        chat_id = int(e.chat_id)
+        joined_user_id = int(e.user_id)
+        reason = "kicked" if e.user_kicked else "left"
+
+        # Kaun-kaun owner is chat ko track kar raha hai
+        res = (
+            supabase.table("invite_links")
+            .select("user_id")
+            .eq("chat_id", chat_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        owners = list({int(r["user_id"]) for r in (res.data or [])})
+
+        if not owners:
+            return
+
+        for uid in owners:
+            # latest join row ko left mark karo
+            jr = (
+                supabase.table("joins")
+                .select("id,left_at")
+                .eq("user_id", uid)
+                .eq("chat_id", chat_id)
+                .eq("joined_user_id", joined_user_id)
+                .order("joined_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            if not jr.data:
+                continue
+
+            row = jr.data[0]
+            if row.get("left_at"):
+                continue
+
+            supabase.table("joins").update(
+                {
+                    "left_at": datetime.now(timezone.utc).isoformat(),
+                    "left_reason": reason,
+                    "left_seen_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).eq("id", row["id"]).execute()
+
+    except Exception as ex:
+        print("track_user_left error:", ex)
 
 
 # ---------------- STATS COMMANDS (PER LINK, WITH SELECTION) ----------------
@@ -1505,13 +1653,12 @@ async def _stats_template(
     uid = e.sender_id
     if not await is_logged_in(uid):
         return await e.respond("🔒 Please `/login` first.", parse_mode="md")
-    if not await require_active_plan(e):
-        return
+    
 
     rows = sp_list_invite_links(uid)
     if not rows:
         return await e.respond(
-            "ℹ️ No active invite links yet. Use `/create_link` first.",
+            "ℹ️ No active invite links yet. Use /create_link first.",
             parse_mode="md",
         )
 
@@ -1566,6 +1713,8 @@ async def cb_stats_link(event):
 
     # Total joins for this link
     total = sp_count_joins_for_link(uid, link_id, since=since, until=until)
+    left_total = sp_count_left_for_link(uid, link_id, since=since, until=until)
+
 
     # Fetch link info once and store in context
     rows = sp_list_invite_links(uid)
@@ -1603,6 +1752,8 @@ async def cb_stats_link(event):
         "link": link,
         "created_at": created_at,
         "link_type": link_type,  # ✅ NEW
+        "left_total": left_total,
+
 
     }
 
@@ -1651,6 +1802,26 @@ async def cb_stats_cancel(event):
 async def stats_all_cmd(e):
     await _stats_template(e, "All time", since=None)
 
+@bot.on(events.NewMessage(pattern=r"^/(?:yesterday|yestarday)$"))
+async def yesterday_status_cmd(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST)
+
+    # Yesterday range in IST
+    y_start_ist = (now_ist - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end_ist = y_start_ist + timedelta(days=1)
+
+    # Convert to UTC for DB filters
+    since_utc = y_start_ist.astimezone(timezone.utc)
+    until_utc = y_end_ist.astimezone(timezone.utc)
+
+    await _stats_template(e, label="Yesterday", since=since_utc, until=until_utc)
+
+
 
 @bot.on(events.NewMessage(pattern=r"^/hour_status$"))
 async def stats_hour_cmd(e):
@@ -1664,6 +1835,26 @@ async def stats_today_cmd(e):
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     await _stats_template(e, "Today", since=start)
+
+@bot.on(events.NewMessage(pattern=r"^/yestarday$"))  # typo support
+async def yesterday_status_cmd(e):
+    uid = e.sender_id
+    if not await is_logged_in(uid):
+        return await e.respond("🔒 Please `/login` first.", parse_mode="md")
+
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST)
+
+    # ✅ yesterday range in IST
+    y_start_ist = (now_ist - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end_ist = y_start_ist + timedelta(days=1)
+
+    # store/filter in UTC timestamps (safe)
+    since_utc = y_start_ist.astimezone(timezone.utc)
+    until_utc = y_end_ist.astimezone(timezone.utc)
+
+    await _stats_template(e, label="Yesterday", since=since_utc, until=until_utc)
+
 
 
 @bot.on(events.NewMessage(pattern=r"^/week_status$"))
@@ -1694,461 +1885,6 @@ async def stats_year_cmd(e):
 #  (AutoForward bot = main product, Join + AutoApprove free with any plan)
 # ---------------------------------------------------------
 
-PLANS_HEADER_TEXT = """
-✨ **GetAIPilot — Plans**
-
-🎁 **Free with any plan:**
-• Auto approval bot — @Getai_approvedbot
-• Join Tracking bot — @Getai_joincountbot
-
-
-💠 **BASIC — ₹699 / 30 days**
-• Unlimited auto-forwarding between your selected chats
-• Choose sources & targets easily
-• Start/Stop forwarding anytime
-• Manage mappings (remove sources/targets)
-• ⚠️ High-size file sending is NOT included
-
-────────────────────────
-
-⚡️ **PRO — ₹1499 / 30 days**
-• Everything in BASIC
-• Text replacement filters (@old → @new)
-• Show / delete one / delete all filters
-• Custom delay control between forwards
-• ✅ High-size media & file sending supported
-
-────────────────────────
-
-💎 **PREMIUM — ₹2499 / 30 days**
-• Everything in PRO
-• Add custom text at the START of every forward
-• Add custom text at the END of every forward
-• Blacklist words (auto-remove from text)
-• ✅ High-size media & file sending supported
-
-_Every payment extends your expiry by +30 days._
-"""
-
-BASIC_PLAN_TEXT = """
-💠 **BASIC — ₹699 / 30 days**
-
-🎁 **Free with this plan:**
-• Auto approval bot — @Getai_approvedbot
-• Join Tracking bot — @Getai_joincountbot
-
-**Features:**
-• Unlimited auto-forwarding between your selected chats
-• Choose sources & targets easily
-• Start/Stop forwarding anytime
-• Manage mappings (remove sources/targets)
-• ⚠️ High-size file sending is NOT included
-
-**Commands in this plan:**
-• `/incoming` — Select source chats
-• `/outgoing` — Select target chats
-• `/work` — Start auto-forward
-• `/stop` — Stop auto-forward
-• `/remove_incoming` — Remove saved sources
-• `/remove_outgoing` — Remove saved targets
-
-⚠️ High-size files not supported
-
-_Validity: 30 days • Every renewal adds +30 days._
-"""
-
-PRO_PLAN_TEXT = """
-⚡️ **PRO — ₹1499 / 30 days**
-
-🎁 **Free with this plan:**
-• Auto approval bot — @Getai_approvedbot
-• Join Tracking bot — @Getai_joincountbot
-
-**Features:**
-• Everything in BASIC
-• Text replacement filters (@old → @new)
-• Show / delete one / delete all filters
-• Custom delay control between forwards
-• ✅ High-size media & file sending supported
-
-**Commands in this plan:**
-• `/incoming`, `/outgoing`, `/work`, `/stop`, `/remove_incoming`, `/remove_outgoing`
-• `/addfilter` — Replace @left with @right
-• `/showfilter` — List filters
-• `/removefilter` — Delete a specific filter
-• `/deleteallfilters` — Clear all filters
-• `/delay` — Set delay (0–999s)
-
-✅ High-size files supported
-
-🎁 **Free with this plan:**
-• Auto approval bot — @Getai_approvedbot
-• Join Tracking bot — @Getai_joincountbot
-
-_Validity: 30 days • Every renewal adds +30 days._
-"""
-
-PREMIUM_PLAN_TEXT = """
-💎 **PREMIUM — ₹2499 / 30 days**
-
-🎁 **Free with this plan:**
-• Auto approval bot — @Getai_approvedbot
-• Join Tracking bot — @Getai_joincountbot
-
-**Features:**
-• Everything in PRO
-• Add custom text at the START of every forward
-• Add custom text at the END of every forward
-• Blacklist words (auto-remove from text)
-• ✅ High-size media & file sending supported
-
-**Commands in this plan:**
-• `/incoming`, `/outgoing`, `/work`, `/stop`, `/remove_incoming`, `/remove_outgoing`
-• `/addfilter`, `/showfilter`, `/removefilter`, `/deleteallfilters`, `/delay`
-• `/start_text` — Set prefix
-• `/end_text` — Set suffix
-• `/remove_text` — Clear prefix/suffix
-• `/blacklist_word` — Add a word to block
-• `/remove_blacklist` — Remove blocked words
-
-✅ High-size files supported
-
-_Validity: 30 days • Every renewal adds +30 days._
-"""
-
-
-def sp_get_latest_payment_link(uid: int, plan_id: str) -> Optional[dict]:
-    """
-    Latest payment link row for this user+plan (from user_payment_links).
-    """
-    try:
-        res = (
-            supabase.table("user_payment_links")
-            .select("*")
-            .eq("user_id", uid)
-            .eq("plan_id", plan_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception as ex:
-        print("sp_get_latest_payment_link error:", ex)
-        return None
-
-
-def sp_apply_successful_payment(uid: int, payment_row: dict) -> datetime:
-    """
-    Mark payment row as paid + extend/activate subscription in user_subscriptions.
-    Returns new expiry datetime (UTC).
-    """
-    now = datetime.now(timezone.utc)
-    plan_id = payment_row.get("plan_id") or "unknown"
-    plan_label = payment_row.get("plan_label") or plan_id.upper()
-    duration_days = int(payment_row.get("duration_days") or PLAN_DURATION_DAYS)
-
-    # Base date = existing active expiry (if any) else now
-    sub = sp_get_subscription(uid)
-    if sub and is_plan_active(sub):
-        try:
-            base = datetime.fromisoformat(str(sub["expires_at"]).replace("Z", "")).astimezone(timezone.utc)
-        except Exception:
-            base = now
-    else:
-        base = now
-
-    new_exp = base + timedelta(days=duration_days)
-
-    payload = {
-        "user_id": uid,
-        "plan_id": plan_id,
-        "plan_label": plan_label,
-        "expires_at": new_exp.isoformat(),
-        "updated_at": now.isoformat(),
-    }
-
-    try:
-        supabase.table("user_subscriptions").upsert(payload, on_conflict="user_id").execute()
-    except Exception as ex:
-        print("sp_apply_successful_payment upsert sub error:", ex)
-
-    # Mark payment row as paid
-    try:
-        supabase.table("user_payment_links").update({"status": "paid"}).eq("paymentlink_id", payment_row["paymentlink_id"]).execute()
-    except Exception as ex:
-        print("sp_apply_successful_payment update payment error:", ex)
-
-    return new_exp
-
-
-async def _show_plans_root(event_or_msg):
-    """
-    Common helper: show main plans list + 3 'View' buttons.
-    Also shows active plan status on top if any.
-    """
-    uid = event_or_msg.sender_id
-    sub = sp_get_subscription(uid)
-    if sub and is_plan_active(sub):
-        status = format_plan_status(uid)
-        txt = status + "\n\n" + PLANS_HEADER_TEXT
-    else:
-        txt = PLANS_HEADER_TEXT
-
-    buttons = [
-        [Button.inline("💠 View BASIC", data=b"plans_basic")],
-        [Button.inline("⚡ View PRO", data=b"plans_pro")],
-        [Button.inline("💎 View PREMIUM", data=b"plans_premium")],
-    ]
-
-    # event_or_msg can be NewMessage event or CallbackQuery
-    if isinstance(event_or_msg, events.CallbackQuery.Event):
-        await event_or_msg.edit(txt, parse_mode="md", buttons=buttons)
-    else:
-        await event_or_msg.respond(txt, parse_mode="md", buttons=buttons)
-
-
-@bot.on(events.NewMessage(pattern=r"^/upgrade$"))
-async def upgrade_cmd(e):
-    """
-    /upgrade -> show GetAIPilot plans + "View BASIC/PRO/PREMIUM" buttons
-    (same style as autoforward bot).
-    """
-    await _show_plans_root(e)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plans_root"))
-async def cb_plans_root(event):
-    await _show_plans_root(event)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plans_basic"))
-async def cb_plans_basic(event):
-    buttons = [
-        [Button.inline("⬅️ Back to Plans", data=b"plans_root")],
-        [Button.inline("💳 Buy ₹699 / 30 days", data=b"buy_basic")],
-    ]
-    await event.edit(BASIC_PLAN_TEXT, parse_mode="md", buttons=buttons)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plans_pro"))
-async def cb_plans_pro(event):
-    buttons = [
-        [Button.inline("⬅️ Back to Plans", data=b"plans_root")],
-        [Button.inline("💳 Buy ₹1499 / 30 days", data=b"buy_pro")],
-    ]
-    await event.edit(PRO_PLAN_TEXT, parse_mode="md", buttons=buttons)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plans_premium"))
-async def cb_plans_premium(event):
-    buttons = [
-        [Button.inline("⬅️ Back to Plans", data=b"plans_root")],
-        [Button.inline("💳 Buy ₹2499 / 30 days", data=b"buy_premium")],
-    ]
-    await event.edit(PREMIUM_PLAN_TEXT, parse_mode="md", buttons=buttons)
-
-async def _show_payment_created(event, plan_id: str, plan_label: str, amount_paise: int):
-    uid = event.sender_id
-
-    # 1) Pehle latest payment link dekho
-    existing = sp_get_latest_payment_link(uid, plan_id)
-    if existing and (existing.get("status") or "").lower() == "created":
-        # Purana link hi use kar lo
-        link_url = existing.get("paymentlink_url")
-    else:
-        # 2) Naya link banao
-        link_url = await create_payment_link(uid, amount_paise, plan_id, plan_label)
-
-    if not link_url:
-        # Yaha aane ka matlab: Razorpay ne error diya (jaise Too many requests)
-        return await event.edit(
-            "❌ Unable to create payment link right now.\n"
-            "❌ Unable to create payment link.\nPlease try again in a minute."
-
-            "⏳ sorry for this problem please try again.",
-            parse_mode="md",
-            buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-        )
-
-    txt = (
-        "🔗 **Payment Link Created**\n"
-        f"Plan: {plan_label} (₹{amount_paise/100:.0f} / 30 days)\n\n"
-        "After payment, press **Verify**."
-    )
-
-    buttons = [
-        [Button.url("💳 Pay Now", link_url)],
-        [Button.inline("✅ I have paid — Verify", data=f"verify_{plan_id}".encode())],
-        [Button.inline("⬅️ Back to Plans", data=b"plans_root")],
-    ]
-
-    await event.edit(txt, parse_mode="md", buttons=buttons)
-
-
-@bot.on(events.CallbackQuery(pattern=b"buy_basic"))
-async def cb_buy_basic(event):
-    await _show_payment_created(event, "basic", " BASIC", BASIC_PRICE_PAISE)
-
-
-@bot.on(events.CallbackQuery(pattern=b"buy_pro"))
-async def cb_buy_pro(event):
-    await _show_payment_created(event, "pro", " PRO", PRO_PRICE_PAISE)
-
-
-@bot.on(events.CallbackQuery(pattern=b"buy_premium"))
-async def cb_buy_premium(event):
-    await _show_payment_created(event, "premium", " PREMIUM", PREMIUM_PRICE_PAISE)
-
-
-async def _handle_verify(event, plan_id: str):
-    """
-    Callback for "I have paid — Verify" buttons.
-    Razorpay HTTP API se payment_link status check karta hai
-    (AutoForward bot ke flow ke jaisa).
-    """
-    uid = event.sender_id
-
-    row = sp_get_latest_payment_link(uid, plan_id)
-    if not row:
-        return await event.edit(
-            "❌ No recent payment link found for this plan.\n"
-            "Use /upgrade → Buy again.",
-            parse_mode="md",
-            buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-        )
-
-    # Agar pehle se paid mark hai to direct status dikha do
-    if (row.get("status") or "").lower() == "paid":
-        msg = "✅ Payment already verified.\n\n" + format_plan_status(uid)
-        return await event.edit(
-            msg,
-            parse_mode="md",
-            buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-        )
-
-    plink_id = row.get("paymentlink_id")
-    if not plink_id:
-        return await event.edit(
-            "❌ This payment link record is missing an id.\n"
-            "Please create a new one via /upgrade.",
-            parse_mode="md",
-            buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-        )
-
-    # ---- Razorpay payment_link fetch (HTTP) ----
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(
-                f"{RP_BASE}/payment_links/{plink_id}",
-                headers=_rp_auth_headers(),
-            ) as resp:
-                if resp.status >= 300:
-                    try:
-                        txt = await resp.text()
-                    except Exception:
-                        txt = "unknown error body"
-                    return await event.edit(
-                        "❌ Failed to verify payment (HTTP error).\n"
-                        f"Status: `{resp.status}`\n"
-                        f"Body: `{txt}`",
-                        parse_mode="md",
-                        buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-                    )
-                info = await resp.json()
-    except Exception as ex:
-        return await event.edit(
-            f"❌ Failed to verify payment:\n`{ex}`",
-            parse_mode="md",
-            buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-        )
-
-    status = (info or {}).get("status", "").lower()
-
-    if status != "paid":
-        # Not paid yet
-        purl = row.get("paymentlink_url")
-        buttons: List[List[Button]] = []
-        if purl:
-            buttons.append([Button.url("💳 Pay Now", purl)])
-        buttons.append([Button.inline("⬅️ Back to Plans", data=b"plans_root")])
-
-        return await event.edit(
-            f"⚠️ Payment is not completed yet.\n"
-            f"Current status: `{status or 'unknown'}`.\n\n"
-            "Please finish payment using *Pay Now*, then press **Verify** again.",
-            parse_mode="md",
-            buttons=buttons,
-        )
-
-    # ---- Mark paid + extend subscription ----
-    new_exp = sp_apply_successful_payment(uid, row)
-    new_exp_str = new_exp.strftime("%Y-%m-%d %H:%M UTC")
-
-    msg = (
-        "✅ **Payment verified successfully!**\n\n"
-        f"Your plan is now active until: `{new_exp_str}`\n\n"
-        "You can now use **GetAIPilot** (autoforward bot) aur\n"
-        "**Join Tracking bot + Auto approval bot** is subscription ke sath."
-    )
-
-    await event.edit(
-        msg,
-        parse_mode="md",
-        buttons=[[Button.inline("⬅️ Back to Plans", data=b"plans_root")]],
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"verify_basic"))
-async def cb_verify_basic(event):
-    await _handle_verify(event, "basic")
-
-
-@bot.on(events.CallbackQuery(pattern=b"verify_pro"))
-async def cb_verify_pro(event):
-    await _handle_verify(event, "pro")
-
-
-@bot.on(events.CallbackQuery(pattern=b"verify_premium"))
-async def cb_verify_premium(event):
-    await _handle_verify(event, "premium")
-
-
-@bot.on(events.NewMessage(pattern=r"^/upgrade_status$"))
-async def upgrade_status_cmd(e):
-    """
-    Show current subscription status (shared across GetAIPilot + all helper bots).
-    """
-    uid = e.sender_id
-    await e.respond(format_plan_status(uid), parse_mode="md")
-
-@bot.on(events.CallbackQuery(pattern=b"plan_basic"))
-async def cb_plan_basic(event):
-    uid = event.sender_id
-    amt = BASIC_PRICE_PAISE
-    link = await create_payment_link(uid, amt, "basic", "BASIC")
-    if not link:
-        return await event.edit("❌ Unable to create payment link. Please try again later.", buttons=None)
-    await event.edit(f"🧾 **Basic Plan**\n\nPay using link below:\n{link}", buttons=None)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plan_pro"))
-async def cb_plan_pro(event):
-    uid = event.sender_id
-    amt = PRO_PRICE_PAISE
-    link = await create_payment_link(uid, amt, "pro", "PRO")
-    if not link:
-        return await event.edit("❌ Unable to create payment link. Please try again later.", buttons=None)
-    await event.edit(f"🧾 **Pro Plan**\n\nPay using link below:\n{link}", buttons=None)
-
-
-@bot.on(events.CallbackQuery(pattern=b"plan_premium"))
-async def cb_plan_premium(event):
-    uid = event.sender_id
-    amt = PREMIUM_PRICE_PAISE
-    link = await create_payment_link(uid, amt, "premium", "PREMIUM")
-    if not link:
-        return await event.edit("❌ Unable to create payment link. Please try again later.", buttons=None)
-    await event.edit(f"🧾 **Premium Plan**\n\nPay using link below:\n{link}", buttons=None)
 
 # ---------------- BOT PROFILE (DESCRIPTION + COMMANDS) ----------------
 
@@ -2184,8 +1920,7 @@ async def setup_bot_profile():
             ("week_status", "Select link & joins last 7 days"),
             ("month_status", "Select link & joins last 30 days"),
             ("year_status", "Select link & joins last 365 days"),
-            ("upgrade", "View subscription plans"),
-            ("upgrade_status", "Check your current plan status"),
+            
         ]
         await bot(
             functions.bots.SetBotCommandsRequest(
@@ -2196,104 +1931,6 @@ async def setup_bot_profile():
         )
     except Exception as e:
         print("Profile/commands set error:", e)
-
-
-# ---------- DEBUG IMPORTERS (optional manual test) ----------
-
-@bot.on(events.NewMessage(pattern=r"^/debug_importers$"))
-async def debug_importers_cmd(e):
-    uid = e.sender_id
-
-    try:
-        uc = await get_user_client(uid)
-    except Exception as ex:
-        return await e.respond(
-            f"⚠️ Not logged in (user client error): `{ex}`",
-            parse_mode="md",
-        )
-
-    try:
-        res = (
-            supabase.table("invite_links")
-            .select("*")
-            .eq("user_id", uid)
-            .eq("is_active", True)
-            .limit(1)
-            .execute()
-        )
-    except Exception as ex:
-        return await e.respond(
-            f"❌ DB error reading invite_links:\n`{ex}`",
-            parse_mode="md",
-        )
-
-    if not res.data:
-        return await e.respond(
-            "ℹ️ No active invite_links found in DB for this user.",
-            parse_mode="md",
-        )
-
-    row = res.data[0]
-    chat_id = int(row["chat_id"])
-    full_link = row["invite_link"]
-
-    link_part = full_link.rsplit("/", 1)[-1]
-    link_part = link_part.lstrip("+").replace("joinchat/", "")
-
-    try:
-        peer = await uc.get_input_entity(chat_id)
-    except Exception as ex:
-        return await e.respond(
-            f"❌ get_input_entity failed for chat_id {chat_id}:\n`{ex}`",
-            parse_mode="md",
-        )
-
-    await e.respond(
-        "🔍 Testing importers for:\n"
-        f"- chat_id: `{chat_id}`\n"
-        f"- link: `{link_part}`\n\n"
-        "Please wait a few seconds...",
-        parse_mode="md",
-    )
-
-    try:
-        result = await uc(
-            functions.messages.GetChatInviteImportersRequest(
-                peer=peer,
-                link=link_part,
-                offset_date=None,
-                offset_user=tl_types.InputUserEmpty(),
-                limit=1000,
-                requested=False,
-            )
-        )
-    except Exception as ex:
-        return await e.respond(
-            f"❌ Telegram API error:\n`{ex}`",
-            parse_mode="md",
-        )
-
-    importers = getattr(result, "importers", []) or []
-    total = len(importers)
-
-    if not total:
-        return await e.respond(
-            "✅ API call succeeded but **0 importers** were returned.\n\n"
-            "Possible reasons:\n"
-            "• No one has joined using this specific invite link yet\n"
-            "• Users joined using a different link or via a public @username\n"
-            "• Your logged-in account is not admin in this channel/group\n",
-            parse_mode="md",
-        )
-
-    lines = [f"✅ `GetChatInviteImporters` OK — found **{total}** user(s).\n"]
-    for imp in importers[:5]:
-        dt = getattr(imp, "date", None)
-        dt_str = dt.isoformat() if dt else "?"
-        lines.append(f"- joined_user_id `{imp.user_id}` at `{dt_str}`")
-
-    await e.respond("\n".join(lines), parse_mode="md")
-
 
 # ---------------- RUN ----------------
 
